@@ -580,7 +580,10 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    assert(virtSize>=physSize);
    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
    blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
-   assert(blockfd>0);
+   if (blockfd == -1) {
+      cerr << "cannot open BLOCK device '" << path << "'" << endl;
+      exit(EXIT_FAILURE);
+   }
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
    useExmap = envOr("EXMAP", 0);
@@ -637,9 +640,11 @@ Page* BufferManager::allocPage() {
    physUsedCount++;
    ensureFreePages();
    u64 pid = allocCount++;
-   assert(pid < virtSize);
+   if (pid >= virtCount) {
+      cerr << "VIRTGB is too low" << endl;
+      exit(EXIT_FAILURE);
+   }
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
-   //assert(PageState::getState(stateAndVersion) == PageState::Evicted);
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
    assert(succ);
    residentSet.insert(pid);
@@ -665,8 +670,6 @@ void BufferManager::handleFault(PID pid) {
 }
 
 Page* BufferManager::fixX(PID pid) {
-   assert(pid < virtCount);
-
    PageState& ps = getPageState(pid);
    for (u64 repeatCounter=0; ; repeatCounter++) {
       u64 stateAndVersion = ps.stateAndVersion.load();
@@ -689,7 +692,6 @@ Page* BufferManager::fixX(PID pid) {
 }
 
 Page* BufferManager::fixS(PID pid) {
-   assert(pid < virtCount);
    PageState& ps = getPageState(pid);
    for (u64 repeatCounter=0; ; repeatCounter++) {
       u64 stateAndVersion = ps.stateAndVersion;
@@ -713,12 +715,10 @@ Page* BufferManager::fixS(PID pid) {
 }
 
 void BufferManager::unfixS(PID pid) {
-   assert(pid < virtCount);
    getPageState(pid).unlockS();
 }
 
 void BufferManager::unfixX(PID pid) {
-   assert(pid < virtCount);
    getPageState(pid).unlockX();
 }
 
