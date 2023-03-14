@@ -21,7 +21,7 @@ Code repository for SIGMOD'23 paper "Virtual-Memory Assisted Buffer Management".
 
 ## Dependencies and Configuration
 
-We need the libaoi and TBB libraries. On Ubuntu, install them like this: `sudo apt install libaio-dev libtbb2-dev`.
+We need the libaoi library. On Ubuntu: `sudo apt install libaio-dev`.
 You will probably also need to set `vm.overcommit_memory = 1` in `/etc/sysctl.conf`. Otherwise larger values of VIRTGB will not work.
 
 If you want to use EXMAP, you need the [exmap kernel module](https://github.com/tuhhosg/exmap).

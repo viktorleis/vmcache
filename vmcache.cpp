@@ -22,10 +22,6 @@
 #include <unistd.h>
 #include <immintrin.h>
 
-#define TBB_SUPPRESS_DEPRECATED_MESSAGES 1
-#include <tbb/parallel_for.h>
-#include <tbb/task_scheduler_init.h>
-
 #include "exmap.h"
 #include "exception_hack.hpp"
 
@@ -47,15 +43,7 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-// Worker threads must register using initWorkerId()
 static const int16_t maxWorkerThreads = 256;
-atomic<int16_t> workerThreadIdCounter(0);
-void initWorkerId() {
-   if (workerThreadId)
-      return;
-   workerThreadId = workerThreadIdCounter++;
-   assert(workerThreadId<maxWorkerThreads);
-}
 
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
 
@@ -1684,19 +1672,25 @@ struct vmcacheAdapter
       });
       return cnt;
    }
-
-   u64 countParallel(Integer warehouseCount) {
-      atomic<u64> count(0);
-      tbb::parallel_for(tbb::blocked_range<Integer>(1, warehouseCount+1), [&](const tbb::blocked_range<Integer>& range) {
-         initWorkerId();
-         for (Integer w_id=range.begin(); w_id<range.end(); w_id++) {
-            count += countw(w_id);
-         }
-      });
-      return count.load();
-   }
-
 };
+
+template<class Fn>
+void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
+   std::vector<std::thread> threads;
+   uint64_t n = end-begin;
+   if (n<nthreads)
+      nthreads = n;
+   uint64_t perThread = n/nthreads;
+   for (unsigned i=0; i<nthreads; i++) {
+      threads.emplace_back([&,i]() {
+         uint64_t b = (perThread*i) + begin;
+         uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
+         fn(i, b, e);
+      });
+   }
+   for (auto& t : threads)
+      t.join();
+}
 
 int main(int argc, char** argv) {
    exception_hack::init_phdr_cache();
@@ -1715,23 +1709,23 @@ int main(int argc, char** argv) {
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
-   tbb::task_scheduler_init init(nthreads);
 
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
    auto systemName = bm.useExmap ? "exmap" : "vmcache";
 
-   auto statFunction = [&]() {
+   auto statFn = [&]() {
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
       u64 cnt = 0;
-      while (keepRunning.load()) {
+      for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
          float rmb = (bm.readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm.writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
          cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
       }
+      keepRunning = false;
    };
 
    if (isRndread) {
@@ -1740,10 +1734,10 @@ int main(int argc, char** argv) {
 
       {
          // insert
-         tbb::parallel_for(tbb::blocked_range<u64>(0, n), [&](const tbb::blocked_range<u64>& range) {
-            initWorkerId();
+         parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+            workerThreadId = worker;
             array<u8, 120> payload;
-            for (u64 i=range.begin(); i<range.end(); i++) {
+            for (u64 i=begin; i<end; i++) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
                v1 = __builtin_bswap64(i);
                memcpy(payload.data(), k1, sizeof(u64));
@@ -1755,44 +1749,35 @@ int main(int argc, char** argv) {
 
       bm.readCount = 0;
       bm.writeCount = 0;
-      vector<thread> threads;
-      threads.emplace_back(statFunction);
+      thread statThread(statFn);
 
-      for (unsigned worker=0; worker<nthreads; worker++) {
-         // lookup
-         threads.emplace_back([&,worker]() {
-            workerThreadId = worker;
-            u64 cnt = 0;
-            u64 start = rdtsc();
-            while (keepRunning.load()) {
-               union { u64 v1; u8 k1[sizeof(u64)]; };
-               v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+      parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+         workerThreadId = worker;
+         u64 cnt = 0;
+         u64 start = rdtsc();
+         while (keepRunning.load()) {
+            union { u64 v1; u8 k1[sizeof(u64)]; };
+            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
 
-               array<u8, 120> payload;
-               bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-                  memcpy(payload.data(), p.data(), p.size());
-               });
-               assert(succ);
-               assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+            array<u8, 120> payload;
+            bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
+               memcpy(payload.data(), p.data(), p.size());
+            });
+            assert(succ);
+            assert(memcmp(k1, payload.data(), sizeof(u64))==0);
 
-               cnt++;
-               u64 stop = rdtsc();
-               if ((stop-start) > statDiff) {
-                  txProgress += cnt;
-                  start = stop;
-                  cnt = 0;
-               }
+            cnt++;
+            u64 stop = rdtsc();
+            if ((stop-start) > statDiff) {
+               txProgress += cnt;
+               start = stop;
+               cnt = 0;
             }
-            txProgress += cnt;
-         });
-      }
+         }
+         txProgress += cnt;
+      });
 
-      sleep(runForSec);
-      keepRunning = false;
-
-      for (auto& t : threads)
-         t.join();
-
+      statThread.join();
       return 0;
    }
 
@@ -1822,9 +1807,10 @@ int main(int argc, char** argv) {
    {
       tpcc.loadItem();
       tpcc.loadWarehouse();
-      tbb::parallel_for(tbb::blocked_range<Integer>(1, warehouseCount+1), [&](const tbb::blocked_range<Integer>& range) {
-         initWorkerId();
-         for (Integer w_id=range.begin(); w_id<range.end(); w_id++) {
+
+      parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+         workerThreadId = worker;
+         for (Integer w_id=begin; w_id<end; w_id++) {
             tpcc.loadStock(w_id);
             tpcc.loadDistrinct(w_id);
             for (Integer d_id = 1; d_id <= 10; d_id++) {
@@ -1838,35 +1824,27 @@ int main(int argc, char** argv) {
 
    bm.readCount = 0;
    bm.writeCount = 0;
-   vector<thread> threads;
-   threads.emplace_back(statFunction);
+   thread statThread(statFn);
 
-
-   for (unsigned worker=0; worker<nthreads; worker++) {
-      threads.emplace_back([&,worker]() {
-         workerThreadId = worker;
-         u64 cnt = 0;
-         u64 start = rdtsc();
-         while (keepRunning.load()) {
-            int w_id = tpcc.urand(1, warehouseCount); // wh crossing
-            tpcc.tx(w_id);
-            cnt++;
-            u64 stop = rdtsc();
-            if ((stop-start) > statDiff) {
-               txProgress += cnt;
-               start = stop;
-               cnt = 0;
-            }
+   parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+      workerThreadId = worker;
+      u64 cnt = 0;
+      u64 start = rdtsc();
+      while (keepRunning.load()) {
+         int w_id = tpcc.urand(1, warehouseCount); // wh crossing
+         tpcc.tx(w_id);
+         cnt++;
+         u64 stop = rdtsc();
+         if ((stop-start) > statDiff) {
+            txProgress += cnt;
+            start = stop;
+            cnt = 0;
          }
-         txProgress += cnt;
-      });
-   }
+      }
+      txProgress += cnt;
+   });
 
-   sleep(runForSec);
-   keepRunning = false;
-   for (auto& t : threads)
-      t.join();
-
+   statThread.join();
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
 
    return 0;
