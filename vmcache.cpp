@@ -23,7 +23,6 @@
 #include <immintrin.h>
 
 #include "exmap.h"
-#include "exception_hack.hpp"
 
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
@@ -1693,8 +1692,6 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 }
 
 int main(int argc, char** argv) {
-   exception_hack::init_phdr_cache();
-
    if (bm.useExmap) {
       struct sigaction action;
       action.sa_flags = SA_SIGINFO;
