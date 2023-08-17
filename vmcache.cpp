@@ -1452,9 +1452,10 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
 
    // split
    BTreeNode::SeparatorInfo sepInfo = node->findSeparator(splitOrdered.load());
+   u8 sepKey[sepInfo.len];
+   node->getSep(sepKey, sepInfo);
+
    if (parent->hasSpaceFor(sepInfo.len, sizeof(PID))) {  // is there enough space in the parent for the separator?
-      u8 sepKey[sepInfo.len];
-      node->getSep(sepKey, sepInfo);
       node->splitNode(parent.ptr, sepInfo.slot, {sepKey, sepInfo.len});
       return;
    }
@@ -1462,7 +1463,7 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
    // must split parent to make space for separator, restart from root to do this
    node.release();
    parent.release();
-   ensureSpace(parent.ptr, key, sizeof(PID));
+   ensureSpace(parent.ptr, {sepKey, sepInfo.len}, sizeof(PID));
 }
 
 void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
