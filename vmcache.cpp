@@ -577,8 +577,8 @@ u64 envOr(const char* env, u64 value) {
 
 BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
    assert(virtSize>=physSize);
-   const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
-   blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
+   const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/dev/vblk1";
+   blockfd = open(path, O_RDWR | O_DIRECT);
    if (blockfd == -1) {
       cerr << "cannot open BLOCK device '" << path << "'" << endl;
       exit(EXIT_FAILURE);
