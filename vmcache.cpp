@@ -248,8 +248,8 @@ struct LibaioInterface {
 
    LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
       memset(&ctx, 0, sizeof(io_context_t));
-      if (io_setup(maxIOs, &ctx) != 0)
-         die("io_setup error");
+      /*if (io_setup(maxIOs, &ctx) != 0)
+         die("io_setup error");*/
    }
 
    void writePages(const vector<PID>& pages) {
@@ -258,12 +258,13 @@ struct LibaioInterface {
          PID pid = pages[i];
          virtMem[pid].dirty = false;
          cbPtr[i] = &cb[i];
-         io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
+         write(blockfd, &virtMem[pid], pageSize);
+         // io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
       }
-      int cnt = io_submit(ctx, pages.size(), cbPtr);
+      /* int cnt = io_submit(ctx, pages.size(), cbPtr);
       assert(cnt == pages.size());
       cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-      assert(cnt == pages.size());
+      assert(cnt == pages.size());*/
    }
 };
 
