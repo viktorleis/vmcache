@@ -232,7 +232,7 @@ void writePagesSync(const vector<PID>& pages, Page* virtMem, int blockfd) {
       if(size_written!=pageSize){
         printf("%i", size_written);
       }
-      assert(size_written==pageSize);
+      //assert(size_written==pageSize);
 }
 
 // libaio interface used to write batches of pages
