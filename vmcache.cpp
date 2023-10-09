@@ -222,6 +222,19 @@ struct ResidentPageSet {
    }
 };
 
+void writePagesSync(const vector<PID>& pages, Page* virtMem, int blockfd) {
+	int size_written;
+      for (u64 i=0; i<pages.size(); i++) {
+         PID pid = pages[i];
+         virtMem[pid].dirty = false;
+         size_written = pwrite(blockfd, &virtMem[pid], pageSize, pageSize*pid);
+      }
+      if(size_written!=pageSize){
+        printf("%i" size_written);
+      }
+      assert(size_written==pageSize);
+}
+
 // libaio interface used to write batches of pages
 struct LibaioInterface {
    static const u64 maxIOs = 256;
@@ -262,7 +275,7 @@ struct BufferManager {
    u64 virtCount;
    u64 physCount;
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
-   vector<LibaioInterface> libaioInterface;
+   //vector<LibaioInterface> libaioInterface;
 
    bool useExmap;
    int blockfd;
@@ -616,9 +629,9 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    if (virtMem == MAP_FAILED)
       die("mmap failed");
 
-   libaioInterface.reserve(maxWorkerThreads);
+   /*libaioInterface.reserve(maxWorkerThreads);
    for (unsigned i=0; i<maxWorkerThreads; i++)
-      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
+      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));*/
 
    physUsedCount = 0;
    allocCount = 1; // pid 0 reserved for meta data
@@ -770,7 +783,8 @@ void BufferManager::evict() {
    }
 
    // 1. write dirty pages
-   libaioInterface[workerThreadId].writePages(toWrite);
+   //libaioInterface[workerThreadId].writePages(toWrite);
+   writePagesSync(toWrite, virtMem, blockfd);
    writeCount += toWrite.size();
 
    // 2. try to lock clean page candidates
