@@ -230,7 +230,7 @@ void writePagesSync(const vector<PID>& pages, Page* virtMem, int blockfd) {
          size_written = pwrite(blockfd, &virtMem[pid], pageSize, pageSize*pid);
       }
       if(size_written!=pageSize){
-        printf("%i" size_written);
+        printf("%i", size_written);
       }
       assert(size_written==pageSize);
 }
