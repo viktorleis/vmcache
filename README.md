@@ -1,16 +1,16 @@
 # vmcache
 
-Code repository for SIGMOD'23 paper "Virtual-Memory Assisted Buffer Management". This is the buffer manager implementation. [exmap](https://github.com/tuhhosg/exmap) is in a separate repository.
+Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/_my_direct_uploads/vmcache.pdf). This is the buffer manager implementation. [exmap](https://github.com/tuhhosg/exmap) is in a separate repository.
 
 ## Environment Variables
 
 * BLOCK: storage block device (e.g. /dev/nvme0n1 or /dev/md0); default=/tmp/bm
 * VIRTGB: virtual memory allocation in GB (e.g., 1024), should be at least device size; default=16
 * PHYSGB: physical memory allocation in GB = buffer pool size, should be less than available RAM; default=4
-* EXMAP: if non-negative, use exmap interface, requires exmap kernel module; default=0
+* EXMAP: if non-zero, use exmap interface, requires exmap kernel module; default=0
 * BATCH: batch size for eviction in pages; default=64
 * RUNFOR: benchmark run duration in seconds; default=30
-* RNDREAD: if non-negative, run random read benchmark, otherwise TPC-C; default=0
+* RNDREAD: if non-zero, run random read benchmark, otherwise TPC-C; default=0
 * THREADS: number of threads; default=1
 * DATASIZE: number of warehouses for TPC-C, number of tuples for random read benchmark; default=10
 
