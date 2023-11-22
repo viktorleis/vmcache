@@ -236,7 +236,7 @@ struct LibaioInterface {
    LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
       memset(&ctx, 0, sizeof(io_context_t));
       if (io_setup(maxIOs, &ctx) != 0)
-         die("io_setup error");
+         die("libaio io_setup error");
    }
 
    void writePages(const vector<PID>& pages) {
@@ -1785,20 +1785,14 @@ int main(int argc, char** argv) {
    vmcacheAdapter<warehouse_t> warehouse;
    vmcacheAdapter<district_t> district;
    vmcacheAdapter<customer_t> customer;
-   customer.tree.splitOrdered = true;
    vmcacheAdapter<customer_wdl_t> customerwdl;
    vmcacheAdapter<history_t> history;
-   history.tree.splitOrdered = true;
    vmcacheAdapter<neworder_t> neworder;
    vmcacheAdapter<order_t> order;
-   order.tree.splitOrdered = true;
    vmcacheAdapter<order_wdc_t> order_wdc;
    vmcacheAdapter<orderline_t> orderline;
-   orderline.tree.splitOrdered = true;
    vmcacheAdapter<item_t> item;
-   item.tree.splitOrdered = true;
    vmcacheAdapter<stock_t> stock;
-   stock.tree.splitOrdered = true;
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
 
