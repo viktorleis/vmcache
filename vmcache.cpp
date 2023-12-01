@@ -22,14 +22,22 @@
 #include <unistd.h>
 #include <immintrin.h>
 
+#ifdef OSV
+#include "drivers/vmcache.hh"
+#include "osv/trace.hh"
+#include "osv/clock.hh"
+#endif //OSV
 #include "exmap.h"
-
+#include <cstring>
+#ifdef LINUX
 __thread uint16_t workerThreadId = 0;
+#endif //LINUX
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
 
 using namespace std;
 
+#ifdef LINUX
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -42,7 +50,7 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-static const int16_t maxWorkerThreads = 256;
+static const int16_t maxWorkerThreads = 64;
 
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
 
@@ -222,19 +230,6 @@ struct ResidentPageSet {
    }
 };
 
-void writePagesSync(const vector<PID>& pages, Page* virtMem, int blockfd) {
-	int size_written;
-      for (u64 i=0; i<pages.size(); i++) {
-         PID pid = pages[i];
-         virtMem[pid].dirty = false;
-         size_written = pwrite(blockfd, &virtMem[pid], pageSize, pageSize*pid);
-      }
-      if(size_written!=pageSize){
-        printf("%i", size_written);
-      }
-      //assert(size_written==pageSize);
-}
-
 // libaio interface used to write batches of pages
 struct LibaioInterface {
    static const u64 maxIOs = 256;
@@ -248,8 +243,8 @@ struct LibaioInterface {
 
    LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
       memset(&ctx, 0, sizeof(io_context_t));
-      /*if (io_setup(maxIOs, &ctx) != 0)
-         die("io_setup error");*/
+      if (io_setup(maxIOs, &ctx) != 0)
+         die("io_setup error");
    }
 
    void writePages(const vector<PID>& pages) {
@@ -258,15 +253,56 @@ struct LibaioInterface {
          PID pid = pages[i];
          virtMem[pid].dirty = false;
          cbPtr[i] = &cb[i];
-         write(blockfd, &virtMem[pid], pageSize);
-         // io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
+         io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
       }
-      /* int cnt = io_submit(ctx, pages.size(), cbPtr);
+      int cnt = io_submit(ctx, pages.size(), cbPtr);
       assert(cnt == pages.size());
       cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-      assert(cnt == pages.size());*/
+      assert(cnt == pages.size());
    }
 };
+
+#include <chrono>
+
+typedef chrono::duration<int64_t, ratio<1, 1000000000>> elapsed_time;
+
+enum parts{
+	allocpage,
+	allocpageinsert,
+	allocpagetrylock,
+	readpage,
+	evictpage,
+	evictpaged0,
+	evictpaged1,
+	evictpaged2,
+	evictpaged3,
+	evictpaged4,
+	evictpaged5,
+	btreeinsert
+};
+static const char * partsStrings[] = { "BufferManager::allocPage()", "allocPage -> residentSet.insert()", "allocPage -> tryLock()", "BufferManager::readPage()", "BufferManager::evict()", "evict -> find candidates", "evict -> write dirty pages", "evict -> try lock clean", "evict -> try upgrade lock", "evict -> remove page table", "evict -> remove hash table", "BTree::insert()" };
+const unsigned parts_num = 12;
+
+mutex thread_mutex;
+__thread elapsed_time parts_time[parts_num] = {};
+__thread uint64_t parts_count[parts_num] = {};
+elapsed_time thread_aggregate_time[parts_num] = {};
+uint64_t thread_aggregate_count[parts_num] {};
+
+void add_thread_results(){
+	lock_guard<mutex> lock(thread_mutex);
+	for(unsigned i=0; i<parts_num; i++){
+		thread_aggregate_time[i] += parts_time[i];
+		thread_aggregate_count[i] += parts_count[i];
+	}
+}
+void print_aggregate_avg(){
+	cout << "Results of the profiling :"<<endl;
+	for(unsigned i=0; i<parts_num; i++){
+		cout << "\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::nanoseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "ns on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
+		cout << "\t\t Total duration: " << double(std::chrono::duration_cast<std::chrono::milliseconds>(thread_aggregate_time[i]).count()) << " ms" <<std::endl;
+	}
+}
 
 struct BufferManager {
    static const u64 mb = 1024ull * 1024;
@@ -276,7 +312,7 @@ struct BufferManager {
    u64 virtCount;
    u64 physCount;
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
-   //vector<LibaioInterface> libaioInterface;
+   vector<LibaioInterface> libaioInterface;
 
    bool useExmap;
    int blockfd;
@@ -315,7 +351,6 @@ struct BufferManager {
    void readPage(PID pid);
    void evict();
 };
-
 
 BufferManager bm;
 
@@ -582,17 +617,17 @@ struct GuardS {
       }
    }
 };
-
+#endif //LINUX
 u64 envOr(const char* env, u64 value) {
    if (getenv(env))
       return atof(getenv(env));
    return value;
 }
-
+#ifdef LINUX
 BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
    assert(virtSize>=physSize);
-   const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/dev/vblk1";
-   blockfd = open(path, O_RDWR | O_DIRECT);
+   const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
+   blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
    if (blockfd == -1) {
       cerr << "cannot open BLOCK device '" << path << "'" << endl;
       exit(EXIT_FAILURE);
@@ -630,10 +665,10 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    if (virtMem == MAP_FAILED)
       die("mmap failed");
 
-   /*libaioInterface.reserve(maxWorkerThreads);
+   libaioInterface.reserve(maxWorkerThreads);
    for (unsigned i=0; i<maxWorkerThreads; i++)
-      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));*/
-
+      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
+   
    physUsedCount = 0;
    allocCount = 1; // pid 0 reserved for meta data
    readCount = 0;
@@ -650,6 +685,7 @@ void BufferManager::ensureFreePages() {
 
 // allocated new page and fix it
 Page* BufferManager::allocPage() {
+   auto start = chrono::high_resolution_clock::now();
    physUsedCount++;
    ensureFreePages();
    u64 pid = allocCount++;
@@ -659,6 +695,7 @@ Page* BufferManager::allocPage() {
    }
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
+   auto mid = chrono::high_resolution_clock::now();
    assert(succ);
    residentSet.insert(pid);
 
@@ -671,6 +708,17 @@ Page* BufferManager::allocPage() {
       }
    }
    virtMem[pid].dirty = true;
+   
+   auto end = chrono::high_resolution_clock::now();
+   auto elapsed = end - start;
+   auto elapsed_mid = mid - start;
+   auto elapsed_end = end - mid;
+   parts_time[allocpageinsert] += elapsed_end;
+   parts_count[allocpageinsert]++;
+   parts_time[allocpagetrylock] += elapsed_mid;
+   parts_count[allocpagetrylock]++;
+   parts_time[allocpage] += elapsed;
+   parts_count[allocpage]++;
 
    return virtMem + pid;
 }
@@ -736,6 +784,7 @@ void BufferManager::unfixX(PID pid) {
 }
 
 void BufferManager::readPage(PID pid) {
+   auto start = chrono::high_resolution_clock::now();
    if (useExmap) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
@@ -749,12 +798,16 @@ void BufferManager::readPage(PID pid) {
       }
    } else {
       int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
-      assert(ret==pageSize);
       readCount++;
    }
+   auto end = chrono::high_resolution_clock::now();
+   auto elapsed = end - start;
+   parts_time[readpage] += elapsed;
+   parts_count[readpage]++;
 }
 
 void BufferManager::evict() {
+   auto start = chrono::high_resolution_clock::now();
    vector<PID> toEvict;
    toEvict.reserve(batch);
    vector<PID> toWrite;
@@ -782,11 +835,12 @@ void BufferManager::evict() {
          };
       });
    }
+   auto m1 = chrono::high_resolution_clock::now();
 
    // 1. write dirty pages
-   //libaioInterface[workerThreadId].writePages(toWrite);
-   writePagesSync(toWrite, virtMem, blockfd);
+   libaioInterface[workerThreadId].writePages(toWrite);
    writeCount += toWrite.size();
+   auto m2 = chrono::high_resolution_clock::now();
 
    // 2. try to lock clean page candidates
    toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
@@ -794,6 +848,7 @@ void BufferManager::evict() {
       u64 v = ps.stateAndVersion;
       return (PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v);
    }), toEvict.end());
+   auto m3 = chrono::high_resolution_clock::now();
 
    // 3. try to upgrade lock for dirty page candidates
    for (auto& pid : toWrite) {
@@ -804,6 +859,7 @@ void BufferManager::evict() {
       else
          ps.unlockS();
    }
+   auto m4 = chrono::high_resolution_clock::now();
 
    // 4. remove from page table
    if (useExmap) {
@@ -817,6 +873,7 @@ void BufferManager::evict() {
       for (u64& pid : toEvict)
          madvise(virtMem + pid, pageSize, MADV_DONTNEED);
    }
+   auto m5 = chrono::high_resolution_clock::now();
 
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
@@ -826,6 +883,28 @@ void BufferManager::evict() {
    }
 
    physUsedCount -= toEvict.size();
+   auto end = chrono::high_resolution_clock::now();
+   auto elapsed = end - start;
+   auto d0 = m1 - start;
+   auto d1 = m2 - m1;
+   auto d2 = m3 - m2;
+   auto d3 = m4 - m3;
+   auto d4 = m5 - m4;
+   auto d5 = end - m5;
+   parts_time[evictpaged0] += d0;
+   parts_count[evictpaged0]++;
+   parts_time[evictpaged1] += d1;
+   parts_count[evictpaged1]++;
+   parts_time[evictpaged2] += d2;
+   parts_count[evictpaged2]++;
+   parts_time[evictpaged3] += d3;
+   parts_count[evictpaged3]++;
+   parts_time[evictpaged4] += d4;
+   parts_count[evictpaged4]++;
+   parts_time[evictpaged5] += d5;
+   parts_count[evictpaged5]++;
+   parts_time[evictpage] += elapsed;
+   parts_count[evictpage]++;
 }
 
 //---------------------------------------------------------------------------
@@ -1506,6 +1585,7 @@ void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
 
 void BTree::insert(span<u8> key, span<u8> payload)
 {
+   auto start = chrono::high_resolution_clock::now();
    assert((key.size()+payload.size()) <= BTreeNode::maxKVSize);
 
    for (u64 repeatCounter=0; ; repeatCounter++) {
@@ -1523,6 +1603,9 @@ void BTree::insert(span<u8> key, span<u8> payload)
             GuardX<BTreeNode> nodeLocked(move(node));
             parent.release();
             nodeLocked->insertInPage(key, payload);
+   	    auto elapsed = chrono::high_resolution_clock::now() - start;
+	    parts_time[btreeinsert] += elapsed;
+	    parts_count[btreeinsert]++;
             return; // success
          }
 
@@ -1575,7 +1658,7 @@ bool BTree::remove(span<u8> key)
       } catch(const OLCRestartException&) {}
    }
 }
-
+#endif //linux
 typedef u64 KeyType;
 
 void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
@@ -1668,7 +1751,7 @@ struct vmcacheAdapter
 
    u64 count() {
       u64 cnt = 0;
-      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; } );
+      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; });
       return cnt;
    }
 
@@ -1699,7 +1782,8 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    for (unsigned i=0; i<nthreads; i++) {
       threads.emplace_back([&,i]() {
          uint64_t b = (perThread*i) + begin;
-         uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
+         //uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
+         uint64_t e = b+perThread;
          fn(i, b, e);
       });
    }
@@ -1707,7 +1791,14 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
       t.join();
 }
 
+
+__thread u64 loadCount = 0;
+
 int main(int argc, char** argv) {
+#ifdef OSV
+   cout << "ACHTUNG : maxWorkerThreads is " << maxWorkerThreads << ", maxQueues is " << maxQueues << endl;
+#endif //OSV
+#ifdef LINUX
    if (bm.useExmap) {
       struct sigaction action;
       action.sa_flags = SA_SIGINFO;
@@ -1717,7 +1808,7 @@ int main(int argc, char** argv) {
          exit(1);
       }
    }
-
+#endif
    unsigned nthreads = envOr("THREADS", 1);
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
@@ -1726,7 +1817,11 @@ int main(int argc, char** argv) {
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
-   auto systemName = bm.useExmap ? "exmap" : "vmcache";
+#ifdef LINUX
+   auto systemName = bm.useExmap ? "exmap" : "linux";
+#else
+   auto systemName = "osv";
+#endif
 
    auto statFn = [&]() {
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
@@ -1743,7 +1838,7 @@ int main(int argc, char** argv) {
 
    if (isRndread) {
       BTree bt;
-      bt.splitOrdered = true;
+      bt.splitOrdered = false;
 
       {
          // insert
@@ -1765,17 +1860,17 @@ int main(int argc, char** argv) {
       thread statThread(statFn);
 
       parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         workerThreadId = worker;
+            workerThreadId = worker;
          u64 cnt = 0;
          u64 start = rdtsc();
          while (keepRunning.load()) {
             union { u64 v1; u8 k1[sizeof(u64)]; };
             v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
 
-            array<u8, 120> payload;
+            array<u8, 120> payload; 
             bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-               memcpy(payload.data(), p.data(), p.size());
-            });
+		memcpy(payload.data(), p.data(), p.size());
+	    });
             assert(succ);
             assert(memcmp(k1, payload.data(), sizeof(u64))==0);
 
@@ -1800,47 +1895,62 @@ int main(int argc, char** argv) {
    vmcacheAdapter<warehouse_t> warehouse;
    vmcacheAdapter<district_t> district;
    vmcacheAdapter<customer_t> customer;
-   customer.tree.splitOrdered = true;
+   customer.tree.splitOrdered = false;
    vmcacheAdapter<customer_wdl_t> customerwdl;
    vmcacheAdapter<history_t> history;
-   history.tree.splitOrdered = true;
+   history.tree.splitOrdered = false;
    vmcacheAdapter<neworder_t> neworder;
    vmcacheAdapter<order_t> order;
-   order.tree.splitOrdered = true;
+   order.tree.splitOrdered = false;
    vmcacheAdapter<order_wdc_t> order_wdc;
    vmcacheAdapter<orderline_t> orderline;
-   orderline.tree.splitOrdered = true;
+   orderline.tree.splitOrdered = false;
    vmcacheAdapter<item_t> item;
-   item.tree.splitOrdered = true;
+   item.tree.splitOrdered = false;
    vmcacheAdapter<stock_t> stock;
-   stock.tree.splitOrdered = true;
+   stock.tree.splitOrdered = false;
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
-
+   #ifdef OSV
+   auto start = osv::clock::uptime::now();
+   #endif //OSV
+   #ifdef LINUX
+   auto start = chrono::high_resolution_clock::now();
+   #endif //LINUX
    {
       tpcc.loadItem();
       tpcc.loadWarehouse();
-
       parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-         workerThreadId = worker;
+            workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
             tpcc.loadStock(w_id);
             tpcc.loadDistrinct(w_id);
+	    //cout << "loading "<< w_id <<endl;
             for (Integer d_id = 1; d_id <= 10; d_id++) {
-               tpcc.loadCustomer(w_id, d_id);
-               tpcc.loadOrders(w_id, d_id);
+                tpcc.loadCustomer(w_id, d_id);
+                tpcc.loadOrders(w_id, d_id);
+	    	//cout << "\t"<< d_id <<endl;
             }
          }
+	add_thread_results();
       });
    }
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
-
+   #ifdef OSV
+   auto end = osv::clock::uptime::now();
+   #endif //OSV
+   #ifdef LINUX
+   auto end = chrono::high_resolution_clock::now();
+   #endif //LINUX
+   cout << "Total time for the insertion : " << chrono::duration_cast<chrono::seconds>(end-start).count() << " s" << endl;
+   //print_aggregate_avg();
+   return 0;
    bm.readCount = 0;
    bm.writeCount = 0;
    thread statThread(statFn);
 
    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-      workerThreadId = worker;
+            workerThreadId = worker;
       u64 cnt = 0;
       u64 start = rdtsc();
       while (keepRunning.load()) {
