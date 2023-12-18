@@ -29,9 +29,7 @@
 #endif //OSV
 #include "exmap.h"
 #include <cstring>
-#ifdef LINUX
 __thread uint16_t workerThreadId = 0;
-#endif //LINUX
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
 
@@ -268,20 +266,12 @@ typedef chrono::duration<int64_t, ratio<1, 1000000000>> elapsed_time;
 
 enum parts{
 	allocpage,
-	allocpageinsert,
-	allocpagetrylock,
 	readpage,
 	evictpage,
-	evictpaged0,
-	evictpaged1,
-	evictpaged2,
-	evictpaged3,
-	evictpaged4,
-	evictpaged5,
 	btreeinsert
 };
-static const char * partsStrings[] = { "BufferManager::allocPage()", "allocPage -> residentSet.insert()", "allocPage -> tryLock()", "BufferManager::readPage()", "BufferManager::evict()", "evict -> find candidates", "evict -> write dirty pages", "evict -> try lock clean", "evict -> try upgrade lock", "evict -> remove page table", "evict -> remove hash table", "BTree::insert()" };
-const unsigned parts_num = 12;
+static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BTree::insert()" };
+const unsigned parts_num = 4;
 
 mutex thread_mutex;
 __thread elapsed_time parts_time[parts_num] = {};
@@ -711,12 +701,6 @@ Page* BufferManager::allocPage() {
    
    auto end = chrono::high_resolution_clock::now();
    auto elapsed = end - start;
-   auto elapsed_mid = mid - start;
-   auto elapsed_end = end - mid;
-   parts_time[allocpageinsert] += elapsed_end;
-   parts_count[allocpageinsert]++;
-   parts_time[allocpagetrylock] += elapsed_mid;
-   parts_count[allocpagetrylock]++;
    parts_time[allocpage] += elapsed;
    parts_count[allocpage]++;
 
@@ -791,6 +775,10 @@ void BufferManager::readPage(PID pid) {
          if (ret == pageSize) {
             assert(ret == pageSize);
             readCount++;
+   	    auto end = chrono::high_resolution_clock::now();
+   	    auto elapsed = end - start;
+   	    parts_time[readpage] += elapsed;
+   	    parts_count[readpage]++;
             return;
          }
          cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
@@ -835,12 +823,10 @@ void BufferManager::evict() {
          };
       });
    }
-   auto m1 = chrono::high_resolution_clock::now();
 
    // 1. write dirty pages
    libaioInterface[workerThreadId].writePages(toWrite);
    writeCount += toWrite.size();
-   auto m2 = chrono::high_resolution_clock::now();
 
    // 2. try to lock clean page candidates
    toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
@@ -848,7 +834,6 @@ void BufferManager::evict() {
       u64 v = ps.stateAndVersion;
       return (PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v);
    }), toEvict.end());
-   auto m3 = chrono::high_resolution_clock::now();
 
    // 3. try to upgrade lock for dirty page candidates
    for (auto& pid : toWrite) {
@@ -859,7 +844,6 @@ void BufferManager::evict() {
       else
          ps.unlockS();
    }
-   auto m4 = chrono::high_resolution_clock::now();
 
    // 4. remove from page table
    if (useExmap) {
@@ -873,7 +857,6 @@ void BufferManager::evict() {
       for (u64& pid : toEvict)
          madvise(virtMem + pid, pageSize, MADV_DONTNEED);
    }
-   auto m5 = chrono::high_resolution_clock::now();
 
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
@@ -885,24 +868,6 @@ void BufferManager::evict() {
    physUsedCount -= toEvict.size();
    auto end = chrono::high_resolution_clock::now();
    auto elapsed = end - start;
-   auto d0 = m1 - start;
-   auto d1 = m2 - m1;
-   auto d2 = m3 - m2;
-   auto d3 = m4 - m3;
-   auto d4 = m5 - m4;
-   auto d5 = end - m5;
-   parts_time[evictpaged0] += d0;
-   parts_count[evictpaged0]++;
-   parts_time[evictpaged1] += d1;
-   parts_count[evictpaged1]++;
-   parts_time[evictpaged2] += d2;
-   parts_count[evictpaged2]++;
-   parts_time[evictpaged3] += d3;
-   parts_count[evictpaged3]++;
-   parts_time[evictpaged4] += d4;
-   parts_count[evictpaged4]++;
-   parts_time[evictpaged5] += d5;
-   parts_count[evictpaged5]++;
    parts_time[evictpage] += elapsed;
    parts_count[evictpage]++;
 }
@@ -1688,7 +1653,7 @@ struct vmcacheAdapter
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
-      });
+      }, workerThreadId);
    }
    // -------------------------------------------------------------------------------------
    void scanDesc(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb) {
@@ -1707,13 +1672,13 @@ struct vmcacheAdapter
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
-      });
+      }, workerThreadId);
    }
    // -------------------------------------------------------------------------------------
    void insert(const typename Record::Key& key, const Record& record) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
-      tree.insert({k, l}, {(u8*)(&record), sizeof(Record)});
+      tree.insert({k, l}, {(u8*)(&record), sizeof(Record)}, workerThreadId);
    }
    // -------------------------------------------------------------------------------------
    template<class Fn>
@@ -1722,7 +1687,7 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       bool succ = tree.lookup({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<const Record*>(payload.data()));
-      });
+      }, workerThreadId);
       assert(succ);
    }
    // -------------------------------------------------------------------------------------
@@ -1732,14 +1697,14 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       tree.updateInPlace({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<Record*>(payload.data()));
-      });
+      }, workerThreadId);
    }
    // -------------------------------------------------------------------------------------
    // Returns false if the record was not found
    bool erase(const typename Record::Key& key) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
-      return tree.remove({k, l});
+      return tree.remove({k, l}, workerThreadId);
    }
    // -------------------------------------------------------------------------------------
    template <class Field>
@@ -1751,7 +1716,7 @@ struct vmcacheAdapter
 
    u64 count() {
       u64 cnt = 0;
-      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; });
+      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; }, workerThreadId);
       return cnt;
    }
 
@@ -1767,7 +1732,7 @@ struct vmcacheAdapter
             return false;
          cnt++;
          return true;
-      });
+      }, workerThreadId);
       return cnt;
    }
 };
@@ -1797,7 +1762,7 @@ __thread u64 loadCount = 0;
 int main(int argc, char** argv) {
 #ifdef OSV
    cout << "ACHTUNG : maxWorkerThreads is " << maxWorkerThreads << ", maxQueues is " << maxQueues << endl;
-#endif //OSV
+   #endif //OSV
 #ifdef LINUX
    if (bm.useExmap) {
       struct sigaction action;
@@ -1849,7 +1814,7 @@ int main(int argc, char** argv) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
                v1 = __builtin_bswap64(i);
                memcpy(payload.data(), k1, sizeof(u64));
-               bt.insert({k1, sizeof(KeyType)}, payload);
+               bt.insert({k1, sizeof(KeyType)}, payload, workerThreadId);
             }
          });
       }
@@ -1870,7 +1835,7 @@ int main(int argc, char** argv) {
             array<u8, 120> payload; 
             bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
 		memcpy(payload.data(), p.data(), p.size());
-	    });
+	    }, workerThreadId);
             assert(succ);
             assert(memcmp(k1, payload.data(), sizeof(u64))==0);
 
@@ -1912,7 +1877,14 @@ int main(int argc, char** argv) {
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
    #ifdef OSV
-   auto start = osv::clock::uptime::now();
+   /*struct sigaction action;
+   action.sa_flags = SA_SIGINFO;
+   action.sa_sigaction = handleSEGFAULT;
+   if(sigaction(SIGSEGV, &action, NULL) == -1){
+	   cerr << "Sigusr: sigaction" << endl;
+	   return -1;
+   }*/
+   //auto start = osv::clock::uptime::now();
    #endif //OSV
    #ifdef LINUX
    auto start = chrono::high_resolution_clock::now();
@@ -1921,7 +1893,7 @@ int main(int argc, char** argv) {
       tpcc.loadItem();
       tpcc.loadWarehouse();
       parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            workerThreadId = worker;
+         workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
             tpcc.loadStock(w_id);
             tpcc.loadDistrinct(w_id);
@@ -1929,28 +1901,28 @@ int main(int argc, char** argv) {
             for (Integer d_id = 1; d_id <= 10; d_id++) {
                 tpcc.loadCustomer(w_id, d_id);
                 tpcc.loadOrders(w_id, d_id);
-	    	//cout << "\t"<< d_id <<endl;
+		//cout << "\t"<< d_id <<endl;
             }
          }
-	add_thread_results();
+	//add_thread_results();
       });
    }
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
    #ifdef OSV
-   auto end = osv::clock::uptime::now();
+   //auto end = osv::clock::uptime::now();
    #endif //OSV
    #ifdef LINUX
    auto end = chrono::high_resolution_clock::now();
    #endif //LINUX
-   cout << "Total time for the insertion : " << chrono::duration_cast<chrono::seconds>(end-start).count() << " s" << endl;
+   //cout << "Total time for the insertion : " << chrono::duration_cast<chrono::seconds>(end-start).count() << " s" << endl;
    //print_aggregate_avg();
-   return 0;
+   //return 0;
    bm.readCount = 0;
    bm.writeCount = 0;
    thread statThread(statFn);
 
    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            workerThreadId = worker;
+      workerThreadId = worker;
       u64 cnt = 0;
       u64 start = rdtsc();
       while (keepRunning.load()) {
@@ -1965,10 +1937,12 @@ int main(int argc, char** argv) {
          }
       }
       txProgress += cnt;
+      //add_thread_results();
    });
 
    statThread.join();
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+   //print_aggregate_avg();
 
    return 0;
 }
