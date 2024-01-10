@@ -818,7 +818,7 @@ void BufferManager::evict() {
 struct BTreeNode;
 
 struct BTreeNodeHeader {
-   static const unsigned underFullSize = pageSize / 4;  // merge nodes below this size
+   static const unsigned underFullSize = (pageSize/2) + (pageSize/4);  // merge nodes more empty
    static const u64 noNeighbour = ~0ull;
 
    struct FenceKeySlot {
