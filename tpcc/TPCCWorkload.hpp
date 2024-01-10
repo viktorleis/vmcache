@@ -876,7 +876,8 @@ struct TPCCWorkload
       vector<Integer> c_ids;
       for (Integer i = 1; i <= 3000; i++)
          c_ids.push_back(i);
-      random_shuffle(c_ids.begin(), c_ids.end());
+      for (Integer i=3000; i>=1 ;i--)
+         std::swap(c_ids[urand(0, i)], c_ids[i]);
       Integer o_id = 1;
       for (Integer o_c_id : c_ids) {
          Integer o_carrier_id = (o_id < 2101) ? rnd(10) + 1 : 0;
