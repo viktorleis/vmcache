@@ -13,6 +13,7 @@
 #include <vector>
 #include <span>
 
+#include <errno.h>
 #include <libaio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -235,8 +236,18 @@ struct LibaioInterface {
 
    LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
       memset(&ctx, 0, sizeof(io_context_t));
-      if (io_setup(maxIOs, &ctx) != 0)
-         die("libaio io_setup error");
+      int ret = io_setup(maxIOs, &ctx);
+      if (ret != 0) {
+         std::cerr << "libaio io_setup error: " << ret << " ";
+         switch (-ret) {
+            case EAGAIN: std::cerr << "EAGAIN"; break;
+            case EFAULT: std::cerr << "EFAULT"; break;
+            case EINVAL: std::cerr << "EINVAL"; break;
+            case ENOMEM: std::cerr << "ENOMEM"; break;
+            case ENOSYS: std::cerr << "ENOSYS"; break;
+         };
+         exit(EXIT_FAILURE);
+      }
    }
 
    void writePages(const vector<PID>& pages) {
