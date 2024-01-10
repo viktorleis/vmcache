@@ -402,7 +402,8 @@ struct TPCCWorkload
           },
           [&]() { items.clear(); });
       std::sort(items.begin(), items.end());
-      std::unique(items.begin(), items.end());
+      auto last = std::unique(items.begin(), items.end());
+      items.erase(last, items.end());
       unsigned count = 0;
       for (Integer i_id : items) {
          auto res_s_quantity = stock.lookupField({w_id, i_id}, &stock_t::s_quantity);
