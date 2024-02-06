@@ -43,7 +43,7 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-static const int16_t maxWorkerThreads = 256;
+static const int16_t maxWorkerThreads = 128;
 
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
 
@@ -1338,7 +1338,7 @@ struct BTree {
             // key found, copy payload
             memcpy(payloadOut, node->getPayload(pos).data(), min(node->slot[pos].payloadLen, payloadOutSize));
             return node->slot[pos].payloadLen;
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1355,7 +1355,7 @@ struct BTree {
             // key found
             fn(node->getPayload(pos));
             return true;
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1377,7 +1377,7 @@ struct BTree {
                fn(nodeLocked->getPayload(pos));
                return true;
             }
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1392,7 +1392,7 @@ struct BTree {
                node = GuardO<BTreeNode>(node->lookupInner(key), node);
 
             return GuardS<BTreeNode>(move(node));
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1401,7 +1401,7 @@ struct BTree {
       GuardS<BTreeNode> node = findLeafS(key);
       bool found;
       unsigned pos = node->lowerBound(key, found);
-      for (u64 repeatCounter=0; ; repeatCounter++) {
+      for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          if (pos<node->count) {
             if (!fn(*node.ptr, pos))
                return;
@@ -1424,7 +1424,7 @@ struct BTree {
          pos--;
          exactMatch = true; // XXX:
       }
-      for (u64 repeatCounter=0; ; repeatCounter++) {
+      for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          while (pos>=0) {
             if (!fn(*node.ptr, pos, exactMatch))
                return;
@@ -1496,7 +1496,7 @@ void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
             trySplit(move(nodeLocked), move(parentLocked), key, payloadLen);
          }
          return;
-      } catch(const OLCRestartException&) {}
+      } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 
@@ -1527,7 +1527,7 @@ void BTree::insert(span<u8> key, span<u8> payload)
          GuardX<BTreeNode> nodeLocked(move(node));
          trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
          // insert hasn't happened, restart from root
-      } catch(const OLCRestartException&) {}
+      } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 
@@ -1568,7 +1568,7 @@ bool BTree::remove(span<u8> key)
             nodeLocked->removeSlot(slotId);
          }
          return true;
-      } catch(const OLCRestartException&) {}
+      } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 
