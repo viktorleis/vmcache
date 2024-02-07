@@ -26,6 +26,7 @@
 #include "drivers/vmcache.hh"
 #include "osv/trace.hh"
 #include "osv/clock.hh"
+#include "osv/sampler.hh"
 #endif //OSV
 #include "exmap.h"
 #include <cstring>
@@ -268,29 +269,39 @@ enum parts{
 	allocpage,
 	readpage,
 	evictpage,
-	btreeinsert
+	btreeinsert,
+	btreelookup,
+	btreescanasc,
+	btreescandesc,
+	btreeupdateinplace,
+	btreeremove,
+	findleafO,
+	guardO
 };
-static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BTree::insert()" };
-const unsigned parts_num = 4;
+static const char * partsStrings[] = { "BufferManager::allocPage()", "BufferManager::readPage()", "BufferManager::evict()", "BTree::insert()", "BTree::lookup()", "BTree::scanAsc()", "BTree::scanDesc()", "BTree::updateInPlace()", "BTree::remove()", "BTree::findLeafO()", "GuardO constructor" };
+const unsigned parts_num = 11;
 
 mutex thread_mutex;
 __thread elapsed_time parts_time[parts_num] = {};
+__thread uint64_t parts_retry[parts_num] = {};
 __thread uint64_t parts_count[parts_num] = {};
 elapsed_time thread_aggregate_time[parts_num] = {};
+uint64_t thread_aggregate_retry[parts_num] {};
 uint64_t thread_aggregate_count[parts_num] {};
 
 void add_thread_results(){
 	lock_guard<mutex> lock(thread_mutex);
 	for(unsigned i=0; i<parts_num; i++){
 		thread_aggregate_time[i] += parts_time[i];
+		thread_aggregate_retry[i] += parts_retry[i];
 		thread_aggregate_count[i] += parts_count[i];
 	}
 }
 void print_aggregate_avg(){
 	cout << "Results of the profiling :"<<endl;
 	for(unsigned i=0; i<parts_num; i++){
-		cout << "\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::nanoseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "ns on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
-		cout << "\t\t Total duration: " << double(std::chrono::duration_cast<std::chrono::milliseconds>(thread_aggregate_time[i]).count()) << " ms" <<std::endl;
+		cout << "\t" << partsStrings[i] << " : " << double(std::chrono::duration_cast<std::chrono::microseconds>(thread_aggregate_time[i]).count())/thread_aggregate_count[i] << "µs on avg over " << thread_aggregate_count[i] << " calls" << std::endl;
+		cout << "\t\tAverage number of retries: " << double(thread_aggregate_retry[i])/thread_aggregate_count[i] <<std::endl;
 	}
 }
 
@@ -360,10 +371,14 @@ struct GuardO {
 
    template<class T2>
    GuardO(u64 pid, GuardO<T2>& parent)  {
+      auto start = chrono::high_resolution_clock::now();
       parent.checkVersionAndRestart();
       this->pid = pid;
       ptr = reinterpret_cast<T*>(bm.toPtr(pid));
+      auto elapsed = chrono::high_resolution_clock::now() - start;
       init();
+      parts_time[guardO]+=elapsed;
+      parts_count[guardO]++;
    }
 
    GuardO(GuardO&& other) {
@@ -1364,12 +1379,16 @@ struct BTree {
    ~BTree();
 
    GuardO<BTreeNode> findLeafO(span<u8> key) {
+      auto start = chrono::high_resolution_clock::now();
       GuardO<MetaDataPage> meta(metadataPageId);
       GuardO<BTreeNode> node(meta->getRoot(slotId), meta);
       meta.release();
 
       while (node->isInner())
          node = GuardO<BTreeNode>(node->lookupInner(key), node);
+      auto elapsed = chrono::high_resolution_clock::now() - start;
+      parts_time[findleafO] += elapsed;
+      parts_count[findleafO]++;
       return node;
    }
 
@@ -1392,16 +1411,26 @@ struct BTree {
 
    template<class Fn>
    bool lookup(span<u8> key, Fn fn) {
+   auto start = chrono::high_resolution_clock::now();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
-            if (!found)
+            if (!found){
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreelookup] += elapsed;
+   		parts_retry[btreelookup] += repeatCounter;
+   		parts_count[btreelookup]++;
                return false;
+	    }
 
             // key found
             fn(node->getPayload(pos));
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreelookup] += elapsed;
+   		parts_retry[btreelookup] += repeatCounter;
+   		parts_count[btreelookup]++;
             return true;
          } catch(const OLCRestartException&) {}
       }
@@ -1412,17 +1441,27 @@ struct BTree {
 
    template<class Fn>
    bool updateInPlace(span<u8> key, Fn fn) {
+      auto start = chrono::high_resolution_clock::now();
       for (u64 repeatCounter=0; ; repeatCounter++) {
          try {
             GuardO<BTreeNode> node = findLeafO(key);
             bool found;
             unsigned pos = node->lowerBound(key, found);
-            if (!found)
+            if (!found){
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreeupdateinplace] += elapsed;
+   		parts_retry[btreeupdateinplace] += repeatCounter;
+   		parts_count[btreeupdateinplace]++;
                return false;
+	    }
 
             {
                GuardX<BTreeNode> nodeLocked(move(node));
                fn(nodeLocked->getPayload(pos));
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreeupdateinplace] += elapsed;
+   		parts_retry[btreeupdateinplace] += repeatCounter;
+   		parts_count[btreeupdateinplace]++;
                return true;
             }
          } catch(const OLCRestartException&) {}
@@ -1446,17 +1485,28 @@ struct BTree {
 
    template<class Fn>
    void scanAsc(span<u8> key, Fn fn) {
+      auto start = chrono::high_resolution_clock::now();
       GuardS<BTreeNode> node = findLeafS(key);
       bool found;
       unsigned pos = node->lowerBound(key, found);
       for (u64 repeatCounter=0; ; repeatCounter++) {
          if (pos<node->count) {
-            if (!fn(*node.ptr, pos))
+            if (!fn(*node.ptr, pos)){
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreescanasc] += elapsed;
+   		parts_retry[btreescanasc] += repeatCounter;
+   		parts_count[btreescanasc]++;
                return;
+	    }
             pos++;
          } else {
-            if (!node->hasRightNeighbour())
+            if (!node->hasRightNeighbour()){
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreescanasc] += elapsed;
+   		parts_retry[btreescanasc] += repeatCounter;
+   		parts_count[btreescanasc]++;
                return;
+	    }
             pos = 0;
             node = GuardS<BTreeNode>(node->nextLeafNode);
          }
@@ -1465,6 +1515,7 @@ struct BTree {
 
    template<class Fn>
    void scanDesc(span<u8> key, Fn fn) {
+      auto start = chrono::high_resolution_clock::now();
       GuardS<BTreeNode> node = findLeafS(key);
       bool exactMatch;
       int pos = node->lowerBound(key, exactMatch);
@@ -1474,12 +1525,22 @@ struct BTree {
       }
       for (u64 repeatCounter=0; ; repeatCounter++) {
          while (pos>=0) {
-            if (!fn(*node.ptr, pos, exactMatch))
+            if (!fn(*node.ptr, pos, exactMatch)){
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreescandesc] += elapsed;
+   		parts_retry[btreescandesc] += repeatCounter;
+   		parts_count[btreescandesc]++;
                return;
+	    }
             pos--;
          }
-         if (!node->hasLowerFence())
+         if (!node->hasLowerFence()){
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreescandesc] += elapsed;
+   		parts_retry[btreescandesc] += repeatCounter;
+   		parts_count[btreescandesc]++;
             return;
+	 }
          node = findLeafS(node->getLowerFence());
          pos = node->count-1;
       }
@@ -1570,6 +1631,7 @@ void BTree::insert(span<u8> key, span<u8> payload)
             nodeLocked->insertInPage(key, payload);
    	    auto elapsed = chrono::high_resolution_clock::now() - start;
 	    parts_time[btreeinsert] += elapsed;
+   	    parts_retry[btreeinsert] += repeatCounter;
 	    parts_count[btreeinsert]++;
             return; // success
          }
@@ -1585,6 +1647,7 @@ void BTree::insert(span<u8> key, span<u8> payload)
 
 bool BTree::remove(span<u8> key)
 {
+   auto start = chrono::high_resolution_clock::now();
    for (u64 repeatCounter=0; ; repeatCounter++) {
       try {
          GuardO<BTreeNode> parent(metadataPageId);
@@ -1600,8 +1663,13 @@ bool BTree::remove(span<u8> key)
 
          bool found;
          unsigned slotId = node->lowerBound(key, found);
-         if (!found)
+         if (!found){
+   		auto elapsed = chrono::high_resolution_clock::now() - start;
+   		parts_time[btreeremove] += elapsed;
+   	        parts_retry[btreeremove] += repeatCounter;
+		parts_count[btreeremove]++;
             return false;
+	 }
 
          unsigned sizeEntry = node->slot[slotId].keyLen + node->slot[slotId].payloadLen;
          if ((node->freeSpaceAfterCompaction()+sizeEntry >= BTreeNodeHeader::underFullSize) && (parent.pid != metadataPageId) && (parent->count >= 2) && ((pos + 1) < parent->count)) {
@@ -1619,6 +1687,10 @@ bool BTree::remove(span<u8> key)
             parent.release();
             nodeLocked->removeSlot(slotId);
          }
+   	auto elapsed = chrono::high_resolution_clock::now() - start;
+   	parts_time[btreeremove] += elapsed;
+   	parts_retry[btreeremove] += repeatCounter;
+	parts_count[btreeremove]++;
          return true;
       } catch(const OLCRestartException&) {}
    }
@@ -1653,7 +1725,12 @@ struct vmcacheAdapter
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
+#ifdef OSV
       }, workerThreadId);
+#endif
+#ifdef LINUX
+      });
+#endif
    }
    // -------------------------------------------------------------------------------------
    void scanDesc(const typename Record::Key& key, const std::function<bool(const typename Record::Key&, const Record&)>& found_record_cb, std::function<void()> reset_if_scan_failed_cb) {
@@ -1672,13 +1749,23 @@ struct vmcacheAdapter
          typename Record::Key typedKey;
          Record::unfoldKey(kk, typedKey);
          return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
+#ifdef OSV
       }, workerThreadId);
+#endif
+#ifdef LINUX
+      });
+#endif
    }
    // -------------------------------------------------------------------------------------
    void insert(const typename Record::Key& key, const Record& record) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
+#ifdef OSV
       tree.insert({k, l}, {(u8*)(&record), sizeof(Record)}, workerThreadId);
+#endif
+#ifdef LINUX
+      tree.insert({k, l}, {(u8*)(&record), sizeof(Record)});
+#endif
    }
    // -------------------------------------------------------------------------------------
    template<class Fn>
@@ -1687,7 +1774,12 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       bool succ = tree.lookup({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<const Record*>(payload.data()));
+#ifdef OSV
       }, workerThreadId);
+#endif
+#ifdef LINUX
+      });
+#endif
       assert(succ);
    }
    // -------------------------------------------------------------------------------------
@@ -1697,14 +1789,24 @@ struct vmcacheAdapter
       u16 l = Record::foldKey(k, key);
       tree.updateInPlace({k, l}, [&](span<u8> payload) {
          fn(*reinterpret_cast<Record*>(payload.data()));
+#ifdef OSV
       }, workerThreadId);
+#endif
+#ifdef LINUX
+      });
+#endif
    }
    // -------------------------------------------------------------------------------------
    // Returns false if the record was not found
    bool erase(const typename Record::Key& key) {
       u8 k[Record::maxFoldLength()];
       u16 l = Record::foldKey(k, key);
+#ifdef OSV
       return tree.remove({k, l}, workerThreadId);
+#endif
+#ifdef LINUX
+      return tree.remove({k, l});
+#endif
    }
    // -------------------------------------------------------------------------------------
    template <class Field>
@@ -1716,7 +1818,12 @@ struct vmcacheAdapter
 
    u64 count() {
       u64 cnt = 0;
+#ifdef OSV
       tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; }, workerThreadId);
+#endif
+#ifdef LINUX
+      tree.scanAsc({(u8*)nullptr, 0}, [&](BTreeNode& node, unsigned slot) { cnt++; return true; });
+#endif
       return cnt;
    }
 
@@ -1732,7 +1839,12 @@ struct vmcacheAdapter
             return false;
          cnt++;
          return true;
+#ifdef OSV
       }, workerThreadId);
+#endif
+#ifdef LINUX
+      });
+#endif
       return cnt;
    }
 };
@@ -1789,14 +1901,16 @@ int main(int argc, char** argv) {
 #endif
 
    auto statFn = [&]() {
-      cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
+      cout << "ts,tx,rmb,wmb,pagesStolen,system,threads,datasize,workload,batch" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
          float rmb = (bm.readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm.writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
+	 u64 nbPagesStolen = 0;//pagesStolen.exchange(0);
+         //cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << nbPagesStolen << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << nbPagesStolen << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
       }
       keepRunning = false;
    };
@@ -1814,7 +1928,12 @@ int main(int argc, char** argv) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
                v1 = __builtin_bswap64(i);
                memcpy(payload.data(), k1, sizeof(u64));
+#ifdef OSV
                bt.insert({k1, sizeof(KeyType)}, payload, workerThreadId);
+#endif
+#ifdef LINUX
+               bt.insert({k1, sizeof(KeyType)}, payload);
+#endif
             }
          });
       }
@@ -1835,7 +1954,12 @@ int main(int argc, char** argv) {
             array<u8, 120> payload; 
             bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
 		memcpy(payload.data(), p.data(), p.size());
-	    }, workerThreadId);
+#ifdef OSV
+            }, workerThreadId);
+#endif
+#ifdef LINUX
+            });
+#endif
             assert(succ);
             assert(memcmp(k1, payload.data(), sizeof(u64))==0);
 
@@ -1885,6 +2009,8 @@ int main(int argc, char** argv) {
 	   return -1;
    }*/
    //auto start = osv::clock::uptime::now();
+   prof::config config{std::chrono::nanoseconds(1000000)};
+   prof::start_sampler(config);
    #endif //OSV
    #ifdef LINUX
    auto start = chrono::high_resolution_clock::now();
@@ -1904,7 +2030,7 @@ int main(int argc, char** argv) {
 		//cout << "\t"<< d_id <<endl;
             }
          }
-	//add_thread_results();
+	add_thread_results();
       });
    }
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
@@ -1937,12 +2063,15 @@ int main(int argc, char** argv) {
          }
       }
       txProgress += cnt;
-      //add_thread_results();
+      add_thread_results();
    });
 
+#ifdef OSV
+   prof::stop_sampler();
+#endif
    statThread.join();
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
-   //print_aggregate_avg();
+   print_aggregate_avg();
 
    return 0;
 }
