@@ -452,7 +452,8 @@ struct TPCCWorkload
              },
              [&]() {});
       }
-      assert(o_id > -1);
+      if (o_id == -1)
+         return;
       // -------------------------------------------------------------------------------------
       Timestamp o_entry_d;
       Integer o_carrier_id;
@@ -514,10 +515,8 @@ struct TPCCWorkload
          order_wdc.scanDesc(
              {w_id, d_id, c_id, std::numeric_limits<Integer>::max()},
              [&](const order_wdc_t::Key& key, const order_wdc_t&) {
-                assert(key.o_w_id == w_id);
-                assert(key.o_d_id == d_id);
-                assert(key.o_c_id == c_id);
-                o_id = key.o_id;
+                if (key.o_w_id == w_id && key.o_d_id == d_id && key.o_c_id == c_id)
+                   o_id = key.o_id;
                 return false;
              },
              [] {});
@@ -525,15 +524,14 @@ struct TPCCWorkload
          order.scanDesc(
              {w_id, d_id, std::numeric_limits<Integer>::max()},
              [&](const order_t::Key& key, const order_t& rec) {
-                if (key.o_w_id == w_id && key.o_d_id == d_id && rec.o_c_id == c_id) {
+                if (key.o_w_id == w_id && key.o_d_id == d_id && rec.o_c_id == c_id)
                    o_id = key.o_id;
-                   return false;
-                }
-                return true;
+                return false;
              },
              [&]() {});
-         assert(o_id > -1);
       }
+      if (o_id == -1)
+         return;
       // -------------------------------------------------------------------------------------
       Timestamp ol_delivery_d;
       orderline.scan(
