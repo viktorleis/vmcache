@@ -15,15 +15,15 @@ autodepend = -MD -MT $@ -MP
 
 COMMON += -D __BSD_VISIBLE=1
 COMMON += -include $(src)/compiler/include/intrinsics.hh
-#COMMON += -O3 -DNDEBUG -DCONF_debug_memory=0 -DOSV
-COMMON += -g -DOSV -DCONF_debug_memory=0
+COMMON += -O3 -DNDEBUG -DCONF_debug_memory=0 -DOSV
+#COMMON += -g -DOSV -DCONF_debug_memory=0
 COMMON += -fnon-call-exceptions -fasynchronous-unwind-tables
 
 CXXFLAGS = -std=c++20 $(COMMON) -shared -fPIC
 LDFLAGS = -shared -fPIC
 
-osv-vmcache: vmcache_modularized.cpp tpcc/*
-	$(CXX) $(CXXFLAGS) $(local-includes) $(INCLUDES)  vmcache_modularized.cpp -o vmcache
+osv-vmcache: vmcache.cpp tpcc/*
+	$(CXX) $(CXXFLAGS) $(local-includes) $(INCLUDES)  vmcache.cpp -o vmcache
 
 
 all: linux-vmcache

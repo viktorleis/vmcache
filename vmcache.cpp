@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <span>
+#include <cmath>
 
 #include <libaio.h>
 #include <sys/mman.h>
@@ -1872,6 +1873,18 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 __thread u64 loadCount = 0;
 
 int main(int argc, char** argv) {
+	/*cout << "BLBL" << std::endl;
+	double x=42;
+	//auto start = osv::clock::uptime::now();
+    	//auto start = chrono::high_resolution_clock::now();
+	for(int i=0; i<10000000; i++){
+		x=cos(x) + chrono::duration_cast<chrono::milliseconds>(osv::clock::uptime::now()-start).count();
+	}
+	auto elapsed = osv::clock::uptime::now() - start;
+	//auto elapsed = chrono::high_resolution_clock::now() - start;
+	cout << "Total time for the insertion : " << chrono::duration_cast<chrono::milliseconds>(elapsed).count() << " s" << x << endl;
+	return 0;
+*/
 #ifdef OSV
    cout << "ACHTUNG : maxWorkerThreads is " << maxWorkerThreads << ", maxQueues is " << maxQueues << endl;
    #endif //OSV
@@ -2001,19 +2014,11 @@ int main(int argc, char** argv) {
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
    #ifdef OSV
-   /*struct sigaction action;
-   action.sa_flags = SA_SIGINFO;
-   action.sa_sigaction = handleSEGFAULT;
-   if(sigaction(SIGSEGV, &action, NULL) == -1){
-	   cerr << "Sigusr: sigaction" << endl;
-	   return -1;
-   }*/
-   //auto start = osv::clock::uptime::now();
-   prof::config config{std::chrono::nanoseconds(1000000)};
-   prof::start_sampler(config);
+   //prof::config config{std::chrono::nanoseconds(1000000)};
+   //prof::start_sampler(config);
    #endif //OSV
    #ifdef LINUX
-   auto start = chrono::high_resolution_clock::now();
+   //auto start = chrono::high_resolution_clock::now();
    #endif //LINUX
    {
       tpcc.loadItem();
@@ -2023,7 +2028,7 @@ int main(int argc, char** argv) {
          for (Integer w_id=begin; w_id<end; w_id++) {
             tpcc.loadStock(w_id);
             tpcc.loadDistrinct(w_id);
-	    //cout << "loading "<< w_id <<endl;
+	    cout << "loading "<< w_id <<endl;
             for (Integer d_id = 1; d_id <= 10; d_id++) {
                 tpcc.loadCustomer(w_id, d_id);
                 tpcc.loadOrders(w_id, d_id);
@@ -2067,7 +2072,7 @@ int main(int argc, char** argv) {
    });
 
 #ifdef OSV
-   prof::stop_sampler();
+   //prof::stop_sampler();
 #endif
    statThread.join();
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
