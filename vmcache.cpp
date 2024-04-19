@@ -1558,8 +1558,9 @@ bool BTree::remove(span<u8> key)
             GuardX<BTreeNode> nodeLocked(move(node));
             GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1));
             nodeLocked->removeSlot(slotId);
-            if (rightLocked->freeSpaceAfterCompaction() >= BTreeNodeHeader::underFullSize) {
+            if (rightLocked->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
                if (nodeLocked->mergeNodes(pos, parentLocked.ptr, rightLocked.ptr)) {
+                  // XXX: should reuse page Id
                }
             }
          } else {
