@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <immintrin.h>
 
+#include "dpdk_memcmp.hh"
 #include "exmap.h"
 
 __thread uint16_t workerThreadId = 0;
@@ -38,6 +39,14 @@ typedef uint64_t u64;
 typedef u64 PID; // page id type
 
 static const u64 pageSize = 4096;
+
+inline int custom_memcmp(const void * ptr1, const void * ptr2, size_t num){
+    #ifdef DPDK_MEMCMP
+        return rte_memcmp(ptr1, ptr2, num);
+    #else
+        return memcmp(ptr1, ptr2, num);
+    #endif
+}
 
 struct alignas(4096) Page {
    bool dirty;
@@ -977,7 +986,7 @@ struct BTreeNode : public BTreeNodeHeader {
       foundExactOut = false;
 
       // check prefix
-      int cmp = memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
+      int cmp = custom_memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
       if (cmp < 0) // key is less than prefix
          return 0;
       if (cmp > 0) // key is greater than prefix
@@ -1001,7 +1010,7 @@ struct BTreeNode : public BTreeNodeHeader {
          } else if (keyHead > slot[mid].head) {
             lower = mid + 1;
          } else { // head is equal, check full key
-            int cmp = memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
+            int cmp = custom_memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
             if (cmp < 0) {
                upper = mid;
             } else if (cmp > 0) {
@@ -1677,7 +1686,7 @@ struct vmcacheAdapter
       tree.scanAsc({k, sizeof(Integer)}, [&](BTreeNode& node, unsigned slot) {
          memcpy(kk, node.getPrefix(), node.prefixLen);
          memcpy(kk+node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
-         if (memcmp(k, kk, sizeof(Integer))!=0)
+         if (custom_memcmp(k, kk, sizeof(Integer))!=0)
             return false;
          cnt++;
          return true;
@@ -1685,6 +1694,15 @@ struct vmcacheAdapter
       return cnt;
    }
 };
+
+int pin_thread_to_core(int core_id) {
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset);
+
+   pthread_t current_thread = pthread_self();
+   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+}
 
 template<class Fn>
 void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
@@ -1695,6 +1713,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    uint64_t perThread = n/nthreads;
    for (unsigned i=0; i<nthreads; i++) {
       threads.emplace_back([&,i]() {
+        pin_thread_to_core(i);
          uint64_t b = (perThread*i) + begin;
          uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
          fn(i, b, e);
@@ -1774,7 +1793,7 @@ int main(int argc, char** argv) {
                memcpy(payload.data(), p.data(), p.size());
             });
             assert(succ);
-            assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+            assert(custom_memcmp(k1, payload.data(), sizeof(u64))==0);
 
             cnt++;
             u64 stop = rdtsc();
