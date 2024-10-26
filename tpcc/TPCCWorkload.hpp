@@ -405,7 +405,8 @@ struct TPCCWorkload
           },
           [&]() { items.clear(); });
       std::sort(items.begin(), items.end());
-      std::unique(items.begin(), items.end());
+      auto last = std::unique(items.begin(), items.end());
+      items.erase(last, items.end());
       unsigned count = 0;
       for (Integer i_id : items) {
          auto res_s_quantity = stock.lookupField({w_id, i_id}, &stock_t::s_quantity);
@@ -454,7 +455,8 @@ struct TPCCWorkload
              },
              [&]() {});
       }
-      assert(o_id > -1);
+      if (o_id == -1)
+         return;
       // -------------------------------------------------------------------------------------
       Timestamp o_entry_d;
       Integer o_carrier_id;
@@ -516,10 +518,8 @@ struct TPCCWorkload
          order_wdc.scanDesc(
              {w_id, d_id, c_id, std::numeric_limits<Integer>::max()},
              [&](const order_wdc_t::Key& key, const order_wdc_t&) {
-                assert(key.o_w_id == w_id);
-                assert(key.o_d_id == d_id);
-                assert(key.o_c_id == c_id);
-                o_id = key.o_id;
+                if (key.o_w_id == w_id && key.o_d_id == d_id && key.o_c_id == c_id)
+                   o_id = key.o_id;
                 return false;
              },
              [] {});
@@ -527,15 +527,14 @@ struct TPCCWorkload
          order.scanDesc(
              {w_id, d_id, std::numeric_limits<Integer>::max()},
              [&](const order_t::Key& key, const order_t& rec) {
-                if (key.o_w_id == w_id && key.o_d_id == d_id && rec.o_c_id == c_id) {
+                if (key.o_w_id == w_id && key.o_d_id == d_id && rec.o_c_id == c_id)
                    o_id = key.o_id;
-                   return false;
-                }
-                return true;
+                return false;
              },
              [&]() {});
-         assert(o_id > -1);
       }
+      if (o_id == -1)
+         return;
       // -------------------------------------------------------------------------------------
       Timestamp ol_delivery_d;
       orderline.scan(
@@ -878,7 +877,8 @@ struct TPCCWorkload
       vector<Integer> c_ids;
       for (Integer i = 1; i <= 3000; i++)
          c_ids.push_back(i);
-      random_shuffle(c_ids.begin(), c_ids.end());
+      for (Integer i=3000; i>=1 ;i--)
+         std::swap(c_ids[urand(0, i)], c_ids[i]);
       Integer o_id = 1;
       for (Integer o_c_id : c_ids) {
          Integer o_carrier_id = (o_id < 2101) ? rnd(10) + 1 : 0;

@@ -14,6 +14,7 @@
 #include <span>
 #include <cmath>
 
+#include <errno.h>
 #include <libaio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -50,7 +51,7 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-static const int16_t maxWorkerThreads = 64;
+static const int16_t maxWorkerThreads = 128;
 
 #define die(msg) do { perror(msg); exit(EXIT_FAILURE); } while(0)
 
@@ -243,8 +244,18 @@ struct LibaioInterface {
 
    LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
       memset(&ctx, 0, sizeof(io_context_t));
-      if (io_setup(maxIOs, &ctx) != 0)
-         die("io_setup error");
+      int ret = io_setup(maxIOs, &ctx);
+      if (ret != 0) {
+         std::cerr << "libaio io_setup error: " << ret << " ";
+         switch (-ret) {
+            case EAGAIN: std::cerr << "EAGAIN"; break;
+            case EFAULT: std::cerr << "EFAULT"; break;
+            case EINVAL: std::cerr << "EINVAL"; break;
+            case ENOMEM: std::cerr << "ENOMEM"; break;
+            case ENOSYS: std::cerr << "ENOSYS"; break;
+         };
+         exit(EXIT_FAILURE);
+      }
    }
 
    void writePages(const vector<PID>& pages) {
@@ -893,7 +904,7 @@ void BufferManager::evict() {
 struct BTreeNode;
 
 struct BTreeNodeHeader {
-   static const unsigned underFullSize = pageSize / 4;  // merge nodes below this size
+   static const unsigned underFullSize = (pageSize/2) + (pageSize/4);  // merge nodes more empty
    static const u64 noNeighbour = ~0ull;
 
    struct FenceKeySlot {
@@ -1406,7 +1417,7 @@ struct BTree {
             // key found, copy payload
             memcpy(payloadOut, node->getPayload(pos).data(), min(node->slot[pos].payloadLen, payloadOutSize));
             return node->slot[pos].payloadLen;
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1433,7 +1444,7 @@ struct BTree {
    		parts_retry[btreelookup] += repeatCounter;
    		parts_count[btreelookup]++;
             return true;
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1465,7 +1476,7 @@ struct BTree {
    		parts_count[btreeupdateinplace]++;
                return true;
             }
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1480,7 +1491,7 @@ struct BTree {
                node = GuardO<BTreeNode>(node->lookupInner(key), node);
 
             return GuardS<BTreeNode>(move(node));
-         } catch(const OLCRestartException&) {}
+         } catch(const OLCRestartException&) { yield(repeatCounter); }
       }
    }
 
@@ -1490,7 +1501,7 @@ struct BTree {
       GuardS<BTreeNode> node = findLeafS(key);
       bool found;
       unsigned pos = node->lowerBound(key, found);
-      for (u64 repeatCounter=0; ; repeatCounter++) {
+      for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          if (pos<node->count) {
             if (!fn(*node.ptr, pos)){
    		auto elapsed = chrono::high_resolution_clock::now() - start;
@@ -1524,7 +1535,7 @@ struct BTree {
          pos--;
          exactMatch = true; // XXX:
       }
-      for (u64 repeatCounter=0; ; repeatCounter++) {
+      for (u64 repeatCounter=0; ; repeatCounter++) { // XXX
          while (pos>=0) {
             if (!fn(*node.ptr, pos, exactMatch)){
    		auto elapsed = chrono::high_resolution_clock::now() - start;
@@ -1606,7 +1617,7 @@ void BTree::ensureSpace(BTreeNode* toSplit, span<u8> key, unsigned payloadLen)
             trySplit(move(nodeLocked), move(parentLocked), key, payloadLen);
          }
          return;
-      } catch(const OLCRestartException&) {}
+      } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 
@@ -1642,7 +1653,7 @@ void BTree::insert(span<u8> key, span<u8> payload)
          GuardX<BTreeNode> nodeLocked(move(node));
          trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
          // insert hasn't happened, restart from root
-      } catch(const OLCRestartException&) {}
+      } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 
@@ -1679,8 +1690,9 @@ bool BTree::remove(span<u8> key)
             GuardX<BTreeNode> nodeLocked(move(node));
             GuardX<BTreeNode> rightLocked(parentLocked->getChild(pos + 1));
             nodeLocked->removeSlot(slotId);
-            if (rightLocked->freeSpaceAfterCompaction() >= BTreeNodeHeader::underFullSize) {
+            if (rightLocked->freeSpaceAfterCompaction() >= (pageSize-BTreeNodeHeader::underFullSize)) {
                if (nodeLocked->mergeNodes(pos, parentLocked.ptr, rightLocked.ptr)) {
+                  // XXX: should reuse page Id
                }
             }
          } else {
@@ -1693,7 +1705,7 @@ bool BTree::remove(span<u8> key)
    	parts_retry[btreeremove] += repeatCounter;
 	parts_count[btreeremove]++;
          return true;
-      } catch(const OLCRestartException&) {}
+      } catch(const OLCRestartException&) { yield(repeatCounter); }
    }
 }
 #endif //linux
@@ -1850,6 +1862,15 @@ struct vmcacheAdapter
    }
 };
 
+int pin_thread_to_core(int core_id) {
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset);
+
+   pthread_t current_thread = pthread_self();
+   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+}
+
 template<class Fn>
 void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    std::vector<std::thread> threads;
@@ -1859,6 +1880,7 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
    uint64_t perThread = n/nthreads;
    for (unsigned i=0; i<nthreads; i++) {
       threads.emplace_back([&,i]() {
+        pin_thread_to_core(i);
          uint64_t b = (perThread*i) + begin;
          //uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
          uint64_t e = b+perThread;
@@ -1997,20 +2019,14 @@ int main(int argc, char** argv) {
    vmcacheAdapter<warehouse_t> warehouse;
    vmcacheAdapter<district_t> district;
    vmcacheAdapter<customer_t> customer;
-   customer.tree.splitOrdered = false;
    vmcacheAdapter<customer_wdl_t> customerwdl;
    vmcacheAdapter<history_t> history;
-   history.tree.splitOrdered = false;
    vmcacheAdapter<neworder_t> neworder;
    vmcacheAdapter<order_t> order;
-   order.tree.splitOrdered = false;
    vmcacheAdapter<order_wdc_t> order_wdc;
    vmcacheAdapter<orderline_t> orderline;
-   orderline.tree.splitOrdered = false;
    vmcacheAdapter<item_t> item;
-   item.tree.splitOrdered = false;
    vmcacheAdapter<stock_t> stock;
-   stock.tree.splitOrdered = false;
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
    #ifdef OSV
