@@ -875,7 +875,7 @@ struct TPCCWorkload
       for (Integer i = 1; i <= 3000; i++)
          c_ids.push_back(i);
       for (Integer i=3000; i>=1 ;i--)
-         std::swap(c_ids[urand(0, i)], c_ids[i]);
+         std::swap(c_ids[urand(0, i - 1)], c_ids[i - 1]);
       Integer o_id = 1;
       for (Integer o_c_id : c_ids) {
          Integer o_carrier_id = (o_id < 2101) ? rnd(10) + 1 : 0;
